@@ -1,0 +1,419 @@
+import os
+import sys
+
+import pauli
+from mlexp_utils import my_logging
+from mlexp_utils.dirs import proj_dir
+from torch_nets import PartWiseVAE, ConditionalVAE, ThroughDataset, ConditionalPartWiseVAE, ARConditionalPartWiseVAE
+import debugpy
+
+# debugpy.listen(5679)
+# print("Waiting for debugger attach")
+# debugpy.wait_for_client()
+sys.path.append(os.path.abspath("./src"))
+
+from argparse import ArgumentParser
+import numpy as np
+import torch
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+
+def main():
+    if args.debug_yes:
+        import pydevd_pycharm
+
+        pydevd_pycharm.settrace(
+            "localhost",
+            port=12345,
+            stdoutToServer=True,
+            stderrToServer=True,
+            suspend=False,
+        )
+
+
+    run_dir = os.getcwd()
+    out_dir = f"{proj_dir}/out/{args.run_name}/{args.out_name}"
+    os.makedirs(out_dir, exist_ok=True)
+    logdir = f"{proj_dir}/logdir/{args.run_name}/{args.out_name}"
+    os.makedirs(logdir, exist_ok=True)
+    logger = my_logging.get_logger(f"{args.out_name}", logdir)
+    logger.info(f"Starting")
+
+    writer = SummaryWriter(logdir)
+    writer.add_text("args", str(args))
+
+    n_epochs = 50
+
+    current_path = os.getcwd()
+    print("Current Path:", current_path)
+
+    pkl_file_path = "torchready_v5_dof_circles.pkl"#f"torchready_v5_dof_1k.pkl"
+    
+    data = torch.load(pkl_file_path)
+
+    # pkl_file_path = f"torchready_v5_dof_1k.pkl"
+    # data1 = torch.load(pkl_file_path)
+
+    for key, value in data.items():
+        #data[key]=np.concatenate((data[key],data1[key]))
+        data[key]=data[key][:800]
+        
+    
+
+    rb_rot_sixd_inv = data["rb_rot_sixd_inv"]
+    rb_rot_sixd_inv = rb_rot_sixd_inv.reshape(-1, 24, 6)
+    dof_pos = data["dof_pos"].reshape(-1, 23, 3)
+
+    rb_rot_sixd = data["rb_rot_sixd"]
+    rb_pos_inv = data["rb_pos_inv"].reshape(-1, 24, 3)
+    rb_pos = data["rb_pos"].reshape(-1, 24, 3)
+    rb_root_pos = rb_pos[:, 0]
+    rb_root_rot_sixd_inv = rb_rot_sixd_inv[:, 0]
+    rb_vel = data["rb_vel"].reshape(-1, 24, 3)
+    rb_root_vel_xy = data["rb_vel"].reshape(-1, 24, 3)[..., 0, :2]
+    rb_vel_inv = data["rb_vel_inv"].reshape(-1, 24, 3)
+    rb_root_vel_inv = data["rb_vel_inv"].reshape(-1, 24, 3)[..., 0, :]
+    rb_ang_vel = data["rb_ang"].reshape(-1, 24, 3)
+    rb_root_ang_vel = rb_ang_vel[..., 0, :]
+
+    
+    #
+    body_names = ["L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe",
+                       "Torso","Spine","Chest","Neck","Head","L_Thorax","L_Shoulder","L_Elbow",
+                       "L_Wrist","L_Hand","R_Thorax","R_Shoulder","R_Elbow","R_Wrist","R_Hand",]
+
+
+    upper_body = [ "Torso", "Spine","Chest", "Neck", "Head", "L_Thorax", "L_Shoulder", "L_Elbow", "L_Wrist", "L_Hand", "R_Thorax", "R_Shoulder", "R_Elbow", "R_Wrist", "R_Hand"]
+    lower_body = [ "L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe", ]
+
+    left_arm = ["L_Thorax", "L_Shoulder", "L_Elbow", "L_Wrist", "L_Hand"]
+    right_arm=["R_Thorax", "R_Shoulder", "R_Elbow", "R_Wrist", "R_Hand"]
+    left_leg=["L_Hip", "L_Knee", "L_Ankle", "L_Toe"]
+    right_leg= ["R_Hip", "R_Knee", "R_Ankle", "R_Toe"]
+    main_body=[ "Torso", "Spine", "Chest", "Neck", "Head"]
+
+
+
+    chains=[lower_body, upper_body ]
+    
+    #NOTE this is a very important note! the order of these part are very important and it should be the same order as of the body names.
+    #TODO implement a way to be able to have different types
+    #chains=[left_leg, right_leg, main_body, left_arm, right_arm, ]
+    chains_indecies = []
+
+    for chain_idx, chain in enumerate(chains):
+        chains_indecies.append([])
+        for bodypart in chain:
+            chains_indecies[chain_idx].append(body_names.index(bodypart))
+
+    # xs = np.concatenate([rb_rot_sixd_inv[:, 1:], rb_ang_vel[:, 1:]], axis=-1)
+    #TODO I am including the root here, but we can remove it in our body part (remove the Pelvis from the lower body list)
+    #[rb_root_vel_xy, rb_root_ang_vel, rb_pos_inv, rb_vel_inv, rb_pos]
+    
+    #xs = np.concatenate([rb_pos_inv[:, 1:], rb_vel_inv[:, 1:],  dof_pos], axis=-1)
+    #xs = np.concatenate([ dof_pos], axis=-1)
+    xs = np.concatenate([rb_root_vel_inv[...,:2], rb_root_ang_vel], axis=-1)
+    #ys_lower = np.concatenate([xs_root, xs[:,chains_indecies[0]].reshape(xs.shape[0], -1 )], axis=-1)
+
+    ys = np.concatenate([rb_root_vel_inv[...,:2], rb_root_ang_vel, dof_pos.reshape(-1,69)], axis=-1)
+    #ys_lower = np.roll(ys_lower, shift=1, axis=0) # shift to the right. this way, it ys[t] contains the pose of t-1
+    #NOTE when we want to remove the pelvix(root) from body parts, the (len(body_names)) should be changed to 23
+    hidden_sizes = []
+    latent_sizes = []
+    # nail_sizes = []
+    # for chain_idx, chain in enumerate(chains):
+    #     percentage = len(chain) / len(body_names)
+    #     hidden_sizes.append(int (percentage * args.hidden_size))
+    #     latent_sizes.append(int (percentage * args.latent_size))
+    #     nail_sizes.append(len(chain) * xs.shape[-1])
+
+    # nail_sizes[0] += 5
+    # cond_sizes = nail_sizes * 1
+    # #cond_sizes[0] =  nail_sizes[0] # lower body: condition on prev lower body + root. done this in prev line
+    # cond_sizes[1] = nail_sizes[0] # upper body: condition on the lower body
+    
+    # latent_sizes[0] = 8
+    # latent_sizes[1] = 8
+    print(latent_sizes)
+    #NOTE no need to reshape, since I do this inside the PVAE
+    xs = xs.reshape(xs.shape[0], -1)
+    xs = torch.tensor(xs, dtype=torch.float)
+
+    ys = ys.reshape(ys.shape[0], -1)
+    ys = torch.tensor(ys, dtype=torch.float)
+
+    n_train = int(xs.shape[0] * 0.99)
+    n_valid = xs.shape[0] - n_train
+
+    np.random.seed(0)
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    train_idxs = np.random.choice(xs.shape[0], n_train, replace=False)
+    # train_idxs = np.arange(10)  # use this for first few frame training
+    valid_idxs = np.setdiff1d(np.arange(xs.shape[0]), train_idxs)
+    xs_train = xs * 1.0 #TODO use train_idx when we have validation. the first index should be the animation idx not the frame idx!
+    xs_train = xs_train.cuda()
+    ys_train = ys * 1.0
+    ys_train = ys_train.cuda()
+    #orig_xs_train = xs[train_idxs] * 1.0
+
+    # print(valid_idxs.shape)
+    # xs_valid = (
+    #     xs[valid_idxs[: int(valid_idxs.shape[0] / 4)]] * 1.0
+    # )  # NOTE is this correct
+    xs_valid = torch.as_tensor(xs[valid_idxs], dtype=torch.float)
+    ys_valid = torch.as_tensor(ys[valid_idxs], dtype=torch.float)
+
+    # print(torch.max(xs_train, dim = -1))
+    # xs_train = xs_train.reshape(xs_train.shape[0], 23,  -1)
+    # xs_valid = xs_valid.reshape(xs_valid.shape[0], 23, -1)
+    # init_lr = 3e-4
+    # init_lr = 5e-5 #smaller init because of nans
+    init_lr = 5e-5  # smaller init because of nans
+    # init_lr = 5e-7  # smaller init because of nans
+
+
+    if args.checkpoint_path is None:
+        model = ConditionalVAE(
+            xs.shape[-1],
+            args.hidden_size,
+            args.latent_size,
+            ys.shape[-1] * args.num_history, # condition size
+            ys.shape[-1], # out size
+        )
+        model = model.cuda()
+        #model.nail_rms = model.nail_rms.cuda()
+        optimizer = Adam(model.parameters(), init_lr)
+        global_steps_elapsed = 0
+        epochs_elapsed = 0
+    else:
+        print("loading from checkpoint.")
+        model_dict = torch.load(args.checkpoint_path)
+        model = pauli.load(model_dict)
+        model.load_state_dict(model_dict["model_state_dict"])
+        model = model.cuda()
+        model.eval()
+        #model.nail_rms = model.nail_rms.cuda()
+        optimizer = Adam(model.parameters(), init_lr)
+        optimizer.load_state_dict(model_dict["optimizer_state_dict"])
+        global_steps_elapsed = model_dict["global_steps_elapsed"]
+        epochs_elapsed = model_dict["epochs_elapsed"]
+
+    save_every = 200
+
+    epoch_num = 0
+
+    dataset = ThroughDataset(
+            xs_train,
+            ys_train,
+        )
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+
+    # save_every = 10
+    # n_total_steps = int(1e7)
+    n_total_steps = int(2.5e6)
+    pbar = tqdm(total=n_total_steps)
+    while global_steps_elapsed <= n_total_steps:
+
+        if epochs_elapsed % save_every == 0 or global_steps_elapsed >= n_total_steps:
+            d = {
+                **pauli.dump(model),
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "global_steps_elapsed": global_steps_elapsed,
+                "epochs_elapsed": epochs_elapsed,
+                "args": args,
+            }
+            save_path = f"{out_dir}/vae_{epochs_elapsed:06d}.pkl"
+            torch.save(d, save_path)
+            logger.info(f"Saved to {save_path}")
+
+            lengths = torch.tensor([800]) #TODO: this is temp for single animation with length of 800
+            t_start = (
+                torch.rand((args.batch_size,))
+                * (lengths - 100 - 2) # making sure it won't go out of animation length
+                + 1
+            ).to(dtype=torch.long)
+            y_hat_start = ys_train[t_start]
+
+            y_hats = [
+                torch.ones_like(y_hat_start)
+                for _ in range(args.num_history) #example: if num_history = 3, it means that it is conditioned on 3 previous frames
+            ]
+
+            rollout_xins = []
+            rollout_youts = []
+            rollout_gts = []
+            with torch.no_grad():
+                for t in range(100):
+                    x_in = xs_train[t_start + t]
+                    w_in = torch.stack(y_hats[-args.num_history :], 1)
+                    w_in = w_in.reshape(w_in.shape[0], -1)
+                    y_tar = ys_train[t_start + t]
+                    z, decoded, mu, log_var = model(x_in, w_in, False)
+                    y_hats.append(decoded)
+
+                    rollout_xins.append(x_in)
+                    rollout_youts.append(decoded)
+                    rollout_gts.append(y_tar)
+
+                rollout_xins = torch.concatenate(rollout_xins, dim=0)
+                rollout_youts = torch.concatenate(rollout_youts, dim=0)
+                rollout_gts = torch.concatenate(rollout_gts, dim=0)
+                
+                #KLD only for last one
+                KLD = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+                mse_loss = torch.nn.MSELoss()
+                MSE = mse_loss(rollout_youts, rollout_gts)
+                writer.add_scalar("valid/MSEloss", MSE.item(), global_steps_elapsed)
+                writer.add_scalar("valid/KLDloss", KLD.item(), global_steps_elapsed)
+
+        # with torch.no_grad():
+        #     xs_valid = xs_valid.cuda()
+            
+
+        #     if(epochs_elapsed > 1):
+        #         ys_lower_valid = validation_predition_output_history[:, :77].detach().clone().cpu() 
+
+        #     ys_lower_valid = ys_lower_valid.cuda()
+
+        #     z, decoded, mu, log_var = model.forward(xs_valid,ys_lower_valid,xs_root_valid, False)
+        #     validation_predition_output_history = decoded * 1
+        #     KLD = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+        #     out_xs = torch.cat([xs_root_valid, xs_valid.reshape(xs_valid.shape[0],-1)],dim=-1)
+        #     MSE = torch.nn.functional.mse_loss(out_xs, decoded)
+        #     MSE_DOF = torch.nn.functional.mse_loss(out_xs[...,143:], decoded[...,143:])
+        #     loss = MSE + KLD * args.kld_weight
+
+        #     writer.add_scalar("valid/MSEloss", MSE.item(), global_steps_elapsed)
+        #     writer.add_scalar("valid/MSE_DOFloss", MSE_DOF.item(), global_steps_elapsed)
+        #     writer.add_scalar("valid/KLDloss", KLD.item(), global_steps_elapsed)
+        if epochs_elapsed % 205 == 0:
+            args.scheduled_sampling_length = min(args.scheduled_sampling_length + 1 , 10)
+
+        logger.info(
+            f"Epoch {epochs_elapsed}:\tMSE: {MSE.item():.3f}\tKLD: {KLD.item():.3f} \tSS: {args.scheduled_sampling_length:.3f}"
+        )
+
+        # lr = init_lr
+        end_lr = 1e-7
+        n_anneal_steps = 2500000
+        ratio = min(1, global_steps_elapsed / n_anneal_steps)
+        lr = init_lr * (1 - ratio) + end_lr * ratio
+        # lr = init_lr * (1 - (min(1, global_steps_elapsed / n_total_steps)))
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+
+        if global_steps_elapsed < n_total_steps:
+
+            # dataloader = DataLoader(dataset, batch_size=4096, shuffle=False)
+            # pbar = tqdm(total=len(dataset))
+
+            # sampling some t
+            lengths = torch.tensor([800]) #TODO: this is temp for single animation with length of 800
+            t_start = (
+                torch.rand((args.batch_size,))
+                * (lengths - args.scheduled_sampling_length - 2) # making sure it won't go out of animation length
+                + 1
+            ).to(dtype=torch.long)
+            y_hat_start = ys_train[t_start]
+
+            y_hats = [
+                torch.ones_like(y_hat_start)
+                for _ in range(args.num_history) #example: if num_history = 3, it means that it is conditioned on 3 previous frames
+            ]
+
+            rollout_xins = []
+            rollout_wins = []
+            rollout_gts = []
+            with torch.no_grad():
+                for t in range(args.scheduled_sampling_length):
+                    x_in = xs_train[t_start + t]
+                    w_in = torch.stack(y_hats[-args.num_history :], 1)
+                    w_in = w_in.reshape(w_in.shape[0], -1)
+                    # if t == 0:
+                    #     w_in = (
+                    #         torch.ones(x_in.shape[0], 2, 3, 6, device=device)
+                    #         * torch.nan
+                    #     )
+                    # else:
+                    #     w_in = torch.stack(y_hats[-args.num_history :], 1)
+                    # w_in = w_in.reshape(w_in.shape[0], 2, 3, 6)
+                    z, decoded, mu, log_var = model(x_in, w_in, False)  # don't collect logits here
+                    # y_tar = train_y[it[:, 0], it[:, 1] + t + 1][:, None]
+                    y_tar = ys_train[t_start + t]
+                    y_hats.append(decoded)
+                    # if t == 0:
+                    #     y_hats.append(w_hat[:, -1])
+                    # y_hats.append(y_hat[:, -1])
+
+                    rollout_xins.append(x_in)
+                    rollout_wins.append(w_in)
+                    rollout_gts.append(y_tar)
+
+
+            rollout_xins = torch.concatenate(rollout_xins, dim=0)
+            rollout_wins = torch.concatenate(rollout_wins, dim=0)
+            rollout_gts = torch.concatenate(rollout_gts, dim=0)
+
+            dataset = ThroughDataset(
+            rollout_xins,
+            rollout_wins,
+            rollout_gts,
+                )
+            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+
+            for i, (x,y, gt) in enumerate(dataloader):
+                # x = x.pin_memory().to("cuda", non_blocking=True, dtype=torch.float)
+                # y = y.pin_memory().to("cuda", non_blocking=True, dtype=torch.float)
+                # gt = gt.pin_memory().to("cuda", non_blocking=True, dtype=torch.float)
+
+                # z, decoded, mu, log_var = model(x, y, True)
+                z, decoded, mu, log_var = model(x,y, False)
+                KLD = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+                loss = torch.nn.functional.mse_loss(decoded, gt) + args.kld_weight * KLD
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                global_steps_elapsed += 1
+
+                pbar.update(1)
+                pbar.set_postfix({"loss": loss.item(), "steps": global_steps_elapsed})
+                if global_steps_elapsed >= n_total_steps:
+                    break
+
+            epoch_num += 1
+            epochs_elapsed += 1
+            writer.add_scalar("train/loss", loss.item(), global_steps_elapsed)
+            writer.add_scalar("train/lr", lr, global_steps_elapsed)
+        else:
+            break
+
+    pbar.close()
+    writer.flush()
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--run_name", type=str, required=True)
+    parser.add_argument("--out_name", type=str, required=True)
+    parser.add_argument("--kld_weight", type=float, default=0)
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--scheduled_sampling_length", type=int, default=1)
+    parser.add_argument("--num_history", type=int, default=1)
+
+    
+    parser.add_argument("--latent_size", type=int, default=16)
+    parser.add_argument("--hidden_size", type=int, default=1024)
+    parser.add_argument("--checkpoint_path", type=str)
+    parser.add_argument("--override_init_yes", action="store_true")
+    parser.add_argument("--debug_yes", action="store_true")
+    args = parser.parse_args()
+
+    main()
